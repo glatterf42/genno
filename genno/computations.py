@@ -3,6 +3,8 @@
 # - To avoid ambiguity, computations should not have default arguments. Define
 #   default values for the corresponding methods on the Computer class.
 import logging
+from abc import abstractmethod
+from functools import partial
 from pathlib import Path
 from typing import Any, Hashable, Mapping
 
@@ -10,6 +12,7 @@ import pandas as pd
 import pint
 
 from genno.core.attrseries import AttrSeries
+from genno.core.key import Key
 from genno.core.quantity import Quantity, assert_quantity, maybe_densify
 from genno.util import collect_units, filter_concat_args
 
@@ -39,6 +42,26 @@ log = logging.getLogger(__name__)
 
 # Carry unit attributes automatically
 xr.set_options(keep_attrs=True)
+
+
+class Computation:
+    """Class for computations / task callables."""
+
+    def __init__(self, *args, **kwargs):
+        return self.compute(*args, **kwargs)
+
+    @staticmethod
+    @abstractmethod
+    def compute(*args, **kwargs):
+        """Perform the computation."""
+
+    def __str__(self) -> str:
+        """Return a display name for the computatiton."""
+        return self.__class__.__name__
+
+    @classmethod
+    def add(cls, computer, *args, **kwargs) -> Key:
+        raise NotImplementedError
 
 
 def add(*quantities, fill_value=0.0):
@@ -318,7 +341,7 @@ def interpolate(
     return qty.interp(coords, method, assume_sorted, kwargs, **coords_kwargs)
 
 
-def load_file(path, dims={}, units=None, name=None):
+class load_file(Computation):
     """Read the file at *path* and return its contents as a :class:`.Quantity`.
 
     Some file formats are automatically converted into objects for direct use in genno
@@ -342,58 +365,100 @@ def load_file(path, dims={}, units=None, name=None):
     name : str
         Name for the loaded Quantity.
     """
-    # TODO optionally cache: if the same Computer is used repeatedly, then the file will
-    #      be read each time; instead cache the contents in memory.
-    # TODO strip leading/trailing whitespace from column names
-    # TODO read units from header
-    if path.suffix == ".csv":
-        data = pd.read_csv(path, comment="#", skipinitialspace=True)
 
-        # Index columns
-        index_columns = data.columns.tolist()
-        index_columns.remove("value")
+    @staticmethod
+    def compute(path, dims={}, units=None, name=None):
+        # TODO optionally cache: if the same Computer is used repeatedly, then the file
+        #      will be read each time; instead cache the contents in memory.
+        # TODO strip leading/trailing whitespace from column names
+        # TODO read units from header
+        if path.suffix == ".csv":
+            data = pd.read_csv(path, comment="#", skipinitialspace=True)
 
-        try:
-            # Retrieve the unit column from the file
-            units_col = data.pop("unit").unique()
-            index_columns.remove("unit")
-        except KeyError:
-            pass  # No such column; use None or argument value
-        else:
-            # Use a unique value for units of the quantity
-            if len(units_col) > 1:
-                raise ValueError(
-                    f"Cannot load {path} with non-unique units {repr(units_col)}"
+            # Index columns
+            index_columns = data.columns.tolist()
+            index_columns.remove("value")
+
+            try:
+                # Retrieve the unit column from the file
+                units_col = data.pop("unit").unique()
+                index_columns.remove("unit")
+            except KeyError:
+                pass  # No such column; use None or argument value
+            else:
+                # Use a unique value for units of the quantity
+                if len(units_col) > 1:
+                    raise ValueError(
+                        f"Cannot load {path} with non-unique units {repr(units_col)}"
+                    )
+                elif units and units not in units_col:
+                    raise ValueError(
+                        f"Explicit units {units} do not match {units_col[0]} in {path}"
+                    )
+                units = units_col[0]
+
+            if len(dims):
+                # Convert a list, set, etc. to a dict
+                dims = dims if isinstance(dims, Mapping) else {d: d for d in dims}
+
+                # - Drop columns not mentioned in *dims*
+                # - Rename columns according to *dims*
+                data = data.drop(columns=set(index_columns) - set(dims.keys())).rename(
+                    columns=dims
                 )
-            elif units and units not in units_col:
-                raise ValueError(
-                    f"Explicit units {units} do not match {units_col[0]} in {path}"
-                )
-            units = units_col[0]
 
-        if len(dims):
-            # Convert a list, set, etc. to a dict
-            dims = dims if isinstance(dims, Mapping) else {d: d for d in dims}
+                index_columns = list(data.columns)
+                index_columns.pop(index_columns.index("value"))
 
-            # - Drop columns not mentioned in *dims*
-            # - Rename columns according to *dims*
-            data = data.drop(columns=set(index_columns) - set(dims.keys())).rename(
-                columns=dims
+            return Quantity(
+                data.set_index(index_columns)["value"], units=units, name=name
             )
+        elif path.suffix in (".xls", ".xlsx"):
+            # TODO define expected Excel data input format
+            raise NotImplementedError  # pragma: no cover
+        elif path.suffix == ".yaml":
+            # TODO define expected YAML data input format
+            raise NotImplementedError  # pragma: no cover
+        else:
+            # Default
+            return open(path).read()
 
-            index_columns = list(data.columns)
-            index_columns.pop(index_columns.index("value"))
+    @classmethod
+    def add(cls, computer, path, key=None, **kwargs):
+        """Add exogenous quantities from *path*.
 
-        return Quantity(data.set_index(index_columns)["value"], units=units, name=name)
-    elif path.suffix in (".xls", ".xlsx"):
-        # TODO define expected Excel data input format
-        raise NotImplementedError  # pragma: no cover
-    elif path.suffix == ".yaml":
-        # TODO define expected YAML data input format
-        raise NotImplementedError  # pragma: no cover
-    else:
-        # Default
-        return open(path).read()
+        Computing the `key` or using it in other computations causes `path` to
+        be loaded and converted to :class:`.Quantity`.
+
+        Parameters
+        ----------
+        path : os.PathLike
+            Path to the file, e.g. '/path/to/foo.ext'.
+        key : str or .Key, optional
+            Key for the quantity read from the file.
+
+        Other parameters
+        ----------------
+        dims : dict or list or set
+            Either a collection of names for dimensions of the quantity, or a
+            mapping from names appearing in the input to dimensions.
+        units : str or pint.Unit
+            Units to apply to the loaded Quantity.
+
+        Returns
+        -------
+        .Key
+            Either `key` (if given) or e.g. ``file:foo.ext`` based on the
+            `path` name, without directory components.
+
+        See also
+        --------
+        genno.computations.load_file
+        """
+        path = Path(path)
+        key = key if key else f"file:{path.name}"
+        computer.add(key, (partial(cls.compute, path, **kwargs),), strict=True)
+        return key
 
 
 def pow(a, b):
@@ -434,26 +499,60 @@ def pow(a, b):
     return result
 
 
-def product(*quantities):
+class product(Computation):
     """Compute the product of any number of *quantities*."""
-    # Iterator over (quantity, unit) tuples
-    items = zip(quantities, collect_units(*quantities))
 
-    # Initialize result values with first entry
-    result, u_result = next(items)
+    @staticmethod
+    def compute(*quantities):
+        # Iterator over (quantity, unit) tuples
+        items = zip(quantities, collect_units(*quantities))
 
-    # Iterate over remaining entries
-    for q, u in items:
-        if isinstance(q, AttrSeries):
-            # Work around pandas-dev/pandas#25760; see attrseries.py
-            result = (result * q.align_levels(result)).dropna()
-        else:
-            result = result * q
-        u_result *= u
+        # Initialize result values with first entry
+        result, u_result = next(items)
 
-    result.attrs["_unit"] = u_result
+        # Iterate over remaining entries
+        for q, u in items:
+            if isinstance(q, AttrSeries):
+                # Work around pandas-dev/pandas#25760; see attrseries.py
+                result = (result * q.align_levels(result)).dropna()
+            else:
+                result = result * q
+            u_result *= u
 
-    return result
+        result.attrs["_unit"] = u_result
+
+        return result
+
+    @classmethod
+    def add(cls, computer, key, *quantities, sums=True):
+        """Add a computation that takes the product of `quantities`.
+
+        Parameters
+        ----------
+        key : str or Key
+            Key of the new quantity. If a Key, any dimensions are ignored; the
+            dimensions of the product are the union of the dimensions of `quantities`.
+        sums : bool, optional
+            If :obj:`True`, all partial sums of the new quantity are also added.
+
+        Returns
+        -------
+        :class:`Key`
+            The full key of the new quantity.
+        """
+        # Fetch the full key for each quantity
+        base_keys = list(map(Key.from_str_or_key, computer.check_keys(*quantities)))
+
+        # Compute a key for the result
+        # Parse the name and tag of the target
+        key = Key.from_str_or_key(key)
+        # New key with dimensions of the product
+        key = Key.product(key.name, *base_keys, tag=key.tag)
+
+        # Add the basic product to the graph and index
+        keys = computer.add(key, cls.compute, *base_keys, sums=sums, index=True)
+
+        return keys[0]
 
 
 def ratio(numerator, denominator):

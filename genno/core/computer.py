@@ -17,7 +17,6 @@ from typing import (
     Optional,
     Tuple,
     Union,
-    cast,
 )
 from warnings import warn
 
@@ -165,25 +164,26 @@ class Computer:
             # A list. Use add_queue to add
             return self.add_queue(data, *args, **kwargs)
 
-        elif isinstance(data, str) and self.get_comp(data):
-            # *data* is the name of a pre-defined computation
-            name = data
-
-            if hasattr(self, f"add_{name}"):
-                # Use a method on the current class to add. This invokes any
-                # argument-handling conveniences, e.g. Computer.add_product()
-                # instead of using the bare product() computation directly.
-                return getattr(self, f"add_{name}")(*args, **kwargs)
-            else:
-                # Get the function directly
-                func = self.get_comp(name)
-                # Rearrange arguments: key, computation function, args, …
-                func, kwargs = partial_split(func, kwargs)
-                return self.add(args[0], func, *args[1:], **kwargs)
-
         elif isinstance(data, str) and data in dir(self):
             # Name of another method, e.g. 'apply'
             return getattr(self, data)(*args, **kwargs)
+
+        elif isinstance(data, str) and self.get_comp(data):
+            # *data* is the name of a pre-defined computation
+
+            # Get the function or computation
+            comp = self.get_comp(data)
+
+            if isinstance(comp, computations.Computation):
+                # A Computation class → use its add() method. This invokes any
+                # argument-handling conveniences, e.g. Computer.add_product()
+                # instead of using the bare product() computation directly.
+                comp.add(self, *args, **kwargs)
+            else:
+                # An ordinary function
+                # Rearrange arguments: key, computation function, args, …
+                func, kwargs = partial_split(comp, kwargs)
+                return self.add_single(args[0], func, *args[1:], **kwargs)
 
         elif isinstance(data, (str, Key)):
             # *data* is a key, *args* are the computation
@@ -571,38 +571,6 @@ class Computer:
         )
 
     # Convenience methods
-    def add_product(self, key, *quantities, sums=True):
-        """Add a computation that takes the product of *quantities*.
-
-        Parameters
-        ----------
-        key : str or Key
-            Key of the new quantity. If a Key, any dimensions are ignored; the
-            dimensions of the product are the union of the dimensions of
-            *quantities*.
-        sums : bool, optional
-            If :obj:`True`, all partial sums of the new quantity are also
-            added.
-
-        Returns
-        -------
-        :class:`Key`
-            The full key of the new quantity.
-        """
-        # Fetch the full key for each quantity
-        base_keys = list(map(Key.from_str_or_key, self.check_keys(*quantities)))
-
-        # Compute a key for the result
-        # Parse the name and tag of the target
-        key = Key.from_str_or_key(key)
-        # New key with dimensions of the product
-        key = Key.product(key.name, *base_keys, tag=key.tag)
-
-        # Add the basic product to the graph and index
-        keys = self.add(key, computations.product, *base_keys, sums=sums, index=True)
-
-        return keys[0]
-
     def aggregate(self, qty, tag, dims_or_groups, weights=None, keep=True, sums=False):
         """Add a computation that aggregates *qty*.
 
@@ -676,55 +644,13 @@ class Computer:
         # Get the method
         if isinstance(method, str):
             try:
-                method = getattr(computations, "disaggregate_{}".format(method))
+                method = getattr(computations, f"disaggregate_{method}")
             except AttributeError:
-                raise ValueError(
-                    "No disaggregation method 'disaggregate_{}'".format(method)
-                )
+                raise ValueError(f"No disaggregation method 'disaggregate_{method}'")
         if not callable(method):
             raise TypeError(method)
 
         return self.add(key, tuple([method, qty] + args), strict=True)
-
-    def add_file(self, path, key=None, **kwargs):
-        """Add exogenous quantities from *path*.
-
-        Computing the `key` or using it in other computations causes `path` to
-        be loaded and converted to :class:`.Quantity`.
-
-        Parameters
-        ----------
-        path : os.PathLike
-            Path to the file, e.g. '/path/to/foo.ext'.
-        key : str or .Key, optional
-            Key for the quantity read from the file.
-
-        Other parameters
-        ----------------
-        dims : dict or list or set
-            Either a collection of names for dimensions of the quantity, or a
-            mapping from names appearing in the input to dimensions.
-        units : str or pint.Unit
-            Units to apply to the loaded Quantity.
-
-        Returns
-        -------
-        .Key
-            Either `key` (if given) or e.g. ``file:foo.ext`` based on the `path` name,
-            without directory components.
-
-        See also
-        --------
-        genno.computations.load_file
-        """
-        path = Path(path)
-        key = key if key else "file:{}".format(path.name)
-        return self.add(
-            key, (partial(self.get_comp("load_file"), path, **kwargs),), strict=True
-        )
-
-    # Use add_file as a helper for computations.load_file
-    add_load_file = add_file
 
     def describe(self, key=None, quiet=True):
         """Return a string describing the computations that produce `key`.
@@ -770,72 +696,15 @@ class Computer:
         """The :meth:`pint.UnitRegistry` used by the Computer."""
         return pint.get_application_registry()
 
-    # For .compat.pyam
+    # Deprecated
+    def add_file(self, *args, **kwargs):
+        warn('Use add("load_file", …) instead', DeprecationWarning)
+        self.add_single("foo")
 
-    # "/, " requires Python 3.8; change only if/when support for Python 3.7 is dropped
-    # def convert_pyam(self, quantities, tag="iamc", /, **kwargs):
-    def convert_pyam(self, quantities, tag="iamc", **kwargs):
-        """Add conversion of one or more **quantities** to IAMC format.
-
-        Parameters
-        ----------
-        quantities : str or Key or list of (str, Key)
-            Keys for quantities to transform.
-        tag : str, optional
-            Tag to append to new Keys.
-
-        Other parameters
-        ----------------
-        kwargs :
-            Any keyword arguments accepted by :func:`.as_pyam`.
-
-        Returns
-        -------
-        list of Key
-            Each task converts a :class:`.Quantity` into a :class:`pyam.IamDataFrame`.
-
-        See also
-        --------
-        .as_pyam
-        """
+    def convert_pyam(self, *args, **kwargs):
         self.require_compat("pyam")
-
-        # Handle single vs. iterable of inputs
-        multi_arg = not isinstance(quantities, (str, Key))
-        if not multi_arg:
-            quantities = [quantities]
-
-        if len(kwargs.get("replace", {})) and not isinstance(
-            next(iter(kwargs["replace"].values())), dict
-        ):
-            kwargs["replace"] = dict(variable=kwargs.pop("replace"))
-            warn(
-                f"replace must be nested dict(), e.g. {repr(kwargs['replace'])}",
-                DeprecationWarning,
-            )
-
-        # Check keys
-        quantities = self.check_keys(*quantities)
-
-        # The callable for the task. If pyam is not available, require_compat() above
-        # will fail; so this will never be None
-        comp = partial(cast(Callable, self.get_comp("as_pyam")), **kwargs)
-
-        keys = []
-        for qty in quantities:
-            # Key for the input quantity
-            key = Key.from_str_or_key(qty)
-
-            # Key for the task
-            keys.append(":".join([key.name, tag]))
-
-            # Add the task and store the key
-            self.add_single(keys[-1], (comp, "scenario", key))
-
-        return tuple(keys) if multi_arg else keys[0]
-
-    # Use convert_pyam as a helper for computations.as_pyam
-    add_as_pyam = convert_pyam
+        warn("convert_pyam", DeprecationWarning)
+        self.add("as_pyam", *args, **kwargs)
 
 
 def maybe_convert_str(key):
